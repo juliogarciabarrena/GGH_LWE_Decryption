@@ -1,0 +1,278 @@
+import sys, glob, itertools, os, time
+from fractions import Fraction
+import numpy as np
+
+try:
+    from fpylll import IntegerMatrix, LLL, CVP, SVP
+    HAY_FPYLLL = True
+except ImportError:
+    HAY_FPYLLL = False
+
+
+# ---------------------------------------------------------------- lectura
+def leer_instancia(ruta):
+    with open(ruta, encoding="latin-1") as f:
+        lineas = [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+    it = iter(lineas)
+    problema = next(it).upper()
+    objetivo = np.array(next(it).split(), dtype=np.int64)
+    dim = int(next(it))
+    base = np.array([next(it).split() for _ in range(dim)], dtype=np.int64)
+    mod = next(it)
+    modulo = None if mod.upper() == "N/A" else int(mod)
+    sol = next(it, "N/D")
+    solucion = None if sol.upper() in ("N/D", "N/A") else np.array(sol.split(), dtype=np.int64)
+    return problema, objetivo, dim, base, modulo, solucion
+
+
+# ---------------------------------------------------------------- LLL (fallback en Python puro)
+def _dot(u, v):
+    return sum(a * b for a, b in zip(u, v))
+
+def _gs(B):
+    n = len(B)
+    Bs, mu = [], [[Fraction(0)] * n for _ in range(n)]
+    for i in range(n):
+        v = [Fraction(x) for x in B[i]]
+        for j in range(i):
+            mu[i][j] = _dot(B[i], Bs[j]) / _dot(Bs[j], Bs[j])
+            v = [a - mu[i][j] * b for a, b in zip(v, Bs[j])]
+        Bs.append(v)
+    return Bs, mu
+
+def lll_py(base, delta=Fraction(99, 100)):
+    B = [[int(x) for x in b] for b in base]
+    n = len(B)
+    Bs, mu = _gs(B)
+    k = 1
+    while k < n:
+        for j in range(k - 1, -1, -1):
+            q = round(mu[k][j])
+            if q:
+                B[k] = [a - q * b for a, b in zip(B[k], B[j])]
+                Bs, mu = _gs(B)
+        if _dot(Bs[k], Bs[k]) >= (delta - mu[k][k - 1] ** 2) * _dot(Bs[k - 1], Bs[k - 1]):
+            k += 1
+        else:
+            B[k], B[k - 1] = B[k - 1], B[k]
+            Bs, mu = _gs(B)
+            k = max(k - 1, 1)
+    return np.array(B, dtype=np.int64)
+
+def reducir(base):
+    if HAY_FPYLLL:
+        M = IntegerMatrix.from_matrix(base.tolist())
+        LLL.reduction(M)
+        return np.array([[M[i, j] for j in range(M.ncols)] for i in range(M.nrows)], dtype=np.int64)
+    return lll_py(base)
+
+
+# ---------------------------------------------------------------- CVP
+def babai_nearest_plane(B, t):
+    """Nearest plane de Babai (mejor que el redondeo simple) sobre base ya reducida."""
+    B = [[int(x) for x in b] for b in B]
+    Bs, _ = _gs(B)
+    b = [Fraction(int(x)) for x in t]
+    for i in range(len(B) - 1, -1, -1):
+        c = round(_dot(b, Bs[i]) / _dot(Bs[i], Bs[i]))
+        b = [x - c * y for x, y in zip(b, B[i])]
+    # t - b es el punto de la celosía
+    return np.array([int(Fraction(int(x)) - y) for x, y in zip(t, b)], dtype=np.int64)
+
+def resolver_cvp(base, objetivo):
+    if HAY_FPYLLL:
+        M = IntegerMatrix.from_matrix(base.tolist())
+        LLL.reduction(M)
+        return np.array(CVP.closest_vector(M, tuple(int(x) for x in objetivo)), dtype=np.int64)
+    return babai_nearest_plane(reducir(base), objetivo)
+
+
+# ---------------------------------------------------------------- SVP
+def resolver_svp(base):
+    if HAY_FPYLLL:
+        M = IntegerMatrix.from_matrix(base.tolist())
+        LLL.reduction(M)
+        return np.array(SVP.shortest_vector(M), dtype=np.int64)
+    R = reducir(base)
+    n = len(R)
+    # el vector más corto de la base LLL ya es una buena aproximación: con su norma
+    # como radio, basta UNA pasada de enumeración de Fincke-Pohst (la misma de más
+    # abajo) para confirmar o mejorar ese candidato, sin fuerza bruta.
+    mejor = min(R, key=lambda v: _dot(v, v))
+    d2 = int(_dot(mejor, mejor))
+    puntos, completo = enumerar(R, np.zeros(n, dtype=np.int64), d2)
+    if completo:
+        no_nulos = [p for p in puntos if p[0] > 0]
+        if no_nulos:
+            _, mejor = min(no_nulos, key=lambda p: p[0])
+    return mejor
+
+
+
+# ---------------------------------------------------------------- verificación de optimalidad
+def _gs_float(R):
+    A = np.array(R, dtype=float)
+    n = len(A)
+    Bs = np.zeros_like(A)
+    mu = np.zeros((n, n))
+    for i in range(n):
+        Bs[i] = A[i]
+        for j in range(i):
+            mu[i, j] = A[i] @ Bs[j] / (Bs[j] @ Bs[j])
+            Bs[i] -= mu[i, j] * Bs[j]
+    return Bs, mu
+
+def enumerar(R, t, radio2, max_nodos=5_000_000):
+    """Fincke-Pohst: todos los puntos v de la celosía (base R, ya reducida) con |v - t|^2 <= radio2.
+    Devuelve (lista de puntos, completo). completo=False si se agotó max_nodos."""
+    n = len(R)
+    Rn = np.array(R, dtype=np.int64)
+    t = np.array(t, dtype=np.int64)
+    Bs, mu = _gs_float(Rn)
+    Bn = (Bs * Bs).sum(axis=1)
+    tc = (Bs @ t.astype(float)) / Bn          # coordenadas de t en la base de Gram-Schmidt
+    eps = 1e-6 * max(1.0, radio2)
+    x = [0] * n
+    puntos, nodos = [], [0]
+
+    def rec(i, resto):
+        if nodos[0] > max_nodos:
+            return
+        nodos[0] += 1
+        c = tc[i] - sum(x[j] * mu[j, i] for j in range(i + 1, n))
+        r = np.sqrt(max(resto, 0) / Bn[i])
+        for xi in range(int(np.ceil(c - r - 1e-9)), int(np.floor(c + r + 1e-9)) + 1):
+            nuevo = resto - (xi - c) ** 2 * Bn[i]
+            if nuevo < -eps:
+                continue
+            x[i] = xi
+            if i == 0:
+                v = np.array(x, dtype=np.int64) @ Rn
+                d2 = int(((v - t) ** 2).sum())      # comprobación exacta con enteros
+                if d2 <= radio2:
+                    puntos.append((d2, v))
+            else:
+                rec(i - 1, nuevo)
+        x[i] = 0
+
+    rec(n - 1, radio2 + eps)
+    return puntos, nodos[0] <= max_nodos
+
+def verificar_optimo(problema, base, objetivo, res):
+    """Devuelve (es_optima, es_unica, mejor, info)."""
+    R = reducir(base)
+    if problema == "CVP":
+        t = objetivo
+        d2 = int(((res - t) ** 2).sum())
+        puntos, completo = enumerar(R, t, d2)
+        if not completo:
+            return None, None, res, "enumeración truncada (dimensión demasiado alta)"
+        mejor_d2, mejor = min(puntos, key=lambda p: p[0])
+        empatados = sum(1 for p in puntos if p[0] == mejor_d2)
+        return mejor_d2 >= d2, empatados == 1, mejor, f"{len(puntos)} punto(s) dentro del radio"
+    # SVP: se enumeran vectores no nulos con |v|^2 <= |res|^2
+    d2 = int((res ** 2).sum())
+    puntos, completo = enumerar(R, np.zeros(len(R), dtype=np.int64), d2)
+    if not completo:
+        return None, None, res, "enumeración truncada (dimensión demasiado alta)"
+    puntos = [p for p in puntos if p[0] > 0]
+    mejor_d2, mejor = min(puntos, key=lambda p: p[0])
+    empatados = sum(1 for p in puntos if p[0] == mejor_d2) // 2   # v y -v cuentan como uno
+    return mejor_d2 >= d2, empatados == 1, mejor, f"{len(puntos)} vector(es) dentro del radio"
+
+# ---------------------------------------------------------------- principal
+def preparar(base, objetivo, modulo):
+    if modulo:
+        return base % modulo, objetivo % modulo
+    return base, objetivo
+
+def crack_ggh(problema, objetivo, base, modulo):
+    base, objetivo = preparar(base, objetivo, modulo)
+    if problema == "CVP":
+        return resolver_cvp(base, objetivo)
+    return resolver_svp(base)
+
+def resolver_fichero(ruta):
+    """Resuelve una instancia e imprime el detalle. Devuelve un dict con los
+    campos que necesita la tabla de resultados (Ejercicio, Problema,
+    Distancia/Norma, Óptima, Tiempo)."""
+    t0 = time.perf_counter()
+
+    problema, objetivo, dim, base, modulo, solucion = leer_instancia(ruta)
+    res = crack_ggh(problema, objetivo, base, modulo)
+
+    if problema == "CVP":
+        metrica = float(np.linalg.norm(res - objetivo))      # distancia al objetivo
+        coef = np.linalg.solve(base.T.astype(float), res.astype(float))
+        en_celosia = bool(np.allclose(coef, np.rint(coef), atol=1e-6))
+    else:
+        metrica = float(np.linalg.norm(res))                 # norma del vector corto
+        en_celosia = True
+
+    b2, o2 = preparar(base, objetivo, modulo)
+    optima, unica, mejor, info = verificar_optimo(problema, b2, o2, res)
+    if not optima:
+        res = mejor
+        # el candidato cambió: hay que recalcular la métrica sobre el resultado corregido
+        if problema == "CVP":
+            metrica = float(np.linalg.norm(res - objetivo))
+            coef = np.linalg.solve(base.T.astype(float), res.astype(float))
+            en_celosia = bool(np.allclose(coef, np.rint(coef), atol=1e-6))
+        else:
+            metrica = float(np.linalg.norm(res))
+
+    coincide = bool(np.array_equal(res, solucion)) if solucion is not None else None
+    tiempo = time.perf_counter() - t0                         # cronómetro de todo el proceso
+
+    # --- impresión del detalle, como hasta ahora ---
+    print(f"\n=== {ruta} ===")
+    print("Problema :", problema, "| Dim:", dim, "| Módulo:", modulo)
+    print("Solución hallada:", res)
+    if problema == "CVP":
+        print("Distancia al objetivo:", round(metrica, 4))
+        print("¿En la celosía?:", en_celosia)
+    else:
+        print("Norma:", round(metrica, 4))
+    if optima is None:
+        print("Optimalidad: NO verificada,", info)
+    elif optima:
+        print("Optimalidad: VERIFICADA (no existe ninguno mejor);",
+              "solución única" if unica else "hay empates", f"[{info}]")
+    else:
+        print("Optimalidad: FALLA, existe uno mejor:", mejor, f"[{info}]")
+    if coincide is not None:
+        print("¿Coincide con la solución dada?:", coincide)
+    print(f"Tiempo: {tiempo:.4f} s")
+
+    # --- fila para la tabla de resultados ---
+    return {
+        "ejercicio": os.path.splitext(os.path.basename(ruta))[0],
+        "problema": problema,
+        "metrica": round(metrica, 4),
+        "optima": optima,     # True / False / None (no verificada)
+        "tiempo": round(tiempo, 4),
+    }
+
+
+def imprimir_tabla(filas):
+    """Imprime el resumen con los 5 campos de la tabla del informe
+    (Ejercicio, Problema, Distancia/Norma, Óptima, Tiempo) y, debajo,
+    las mismas filas listas para pegar en la tabla de Typst."""
+    cab = f'{"Ejercicio":<16}{"Problema":<10}{"Dist./Norma":<14}{"Óptima":<10}{"Tiempo (s)":<10}'
+    print("\n" + cab)
+    print("-" * len(cab))
+    for f in filas:
+        opt = "sí" if f["optima"] else ("no" if f["optima"] is False else "no verif.")
+        print(f'{f["ejercicio"]:<16}{f["problema"]:<10}{f["metrica"]:<14}{opt:<10}{f["tiempo"]:<10}')
+
+    print("\n--- filas para la tabla de Typst (Resolución de tareas > Problemas GGH) ---")
+    for f in filas:
+        opt = "sí" if f["optima"] else ("no" if f["optima"] is False else "no verif.")
+        print(f'  [{f["ejercicio"]}], [{f["problema"]}], [{f["metrica"]}], [{opt}], [{f["tiempo"]}],')
+
+
+if __name__ == "__main__":
+    rutas = sys.argv[1:] or sorted(glob.glob(r"ejercicios\Tier0*"))
+    print("fpylll:", "sí" if HAY_FPYLLL else "no (usando LLL en Python puro)")
+    filas = [resolver_fichero(r) for r in rutas]
+    imprimir_tabla(filas)
